@@ -1,6 +1,8 @@
 # check_raspi_temperature
 nagios check for Raspberry Pi onboard CPU/GPU temperature sensors, as well as 1-wire USB-attached temperature sensors.
 
+NOTE: only the DigiTemp DS9097U 1-wire USB-attached temperature sensor is available to the author.  Pull requests to support additional sensors are most welcome!
+
 # Requirements
 ssh on nagios server, perl and ssh on monitored Raspberry Pi
 
