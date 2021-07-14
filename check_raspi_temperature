@@ -1,0 +1,397 @@
+#!/usr/bin/perl -w
+
+
+# CHANGE LOG
+# ----------
+#  2016-12-15   njeffrey   	Script created 
+#  2017-03-12   njeffrey   	Add retry if temperature probe times out
+#  2017-09-17   njeffrey   	Add -v switch
+#  2018-07-07	njeffrey       	Add nagios performance data to output
+#  2021-07-13	njeffrey       	Add CPU/GPU temperature checks
+#  2021-07-13	njeffrey       	Change the USB-attached Digitemp DS9097U temperature sensor to optional 
+
+
+# ASSUMPTIONS
+# ----------
+#  This check will always query the onboard GPU temperature sensor.
+#
+#  If the Raspberry Pi has the /usr/local/bin/digitemp_DS9097U binary installed, it will also check 
+#  for temperature readings from the USB-attached temperature probes (2 probes by default)
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+
+
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking ambient temperature from raspberry pi
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       server001
+#           service_description             temperature
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_raspi_temperature"
+#           }
+#
+
+
+
+
+use strict;                             #enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$verbose,$cmd,$output_details,$perf_data);
+my ($vcgencmd,$gpu_temperature,$cpu_temperature,$digitemp,$sensor0_c,$sensor0_f,$sensor1_c,$sensor1_f);
+my ($inside_keezer_min_crit,$inside_keezer_max_crit,$inside_keezer_min_warn,$inside_keezer_max_warn);
+my ($ambient_temp_min_crit,$ambient_temp_max_crit,$ambient_temp_min_warn,$ambient_temp_max_warn);
+my ($cpu_temp,$cpu_temp_min_crit,$cpu_temp_max_crit,$cpu_temp_min_warn,$cpu_temp_max_warn);
+my ($gpu_temp,$gpu_temp_min_crit,$gpu_temp_max_crit,$gpu_temp_min_warn,$gpu_temp_max_warn);
+my ($opt_h,$opt_w,$opt_c,$opt_v);
+$digitemp = "/usr/local/digitemp/digitemp_DS9097U";  #binary supplied with digitemp USB-attached temperature sensor
+$vcgencmd = "/opt/vc/bin/vcgencmd";		#binary to check GPU temperature, should be included with Raspian default install
+$CHECK_NAME                 = "temperature";
+$verbose = "no";				#yes/no flag to increase verbosity for debugging
+$inside_keezer_min_crit = 1;
+$inside_keezer_max_crit = 14;
+$inside_keezer_min_warn = 2;
+$inside_keezer_max_warn = 7;
+$ambient_temp_min_crit  = 10; 
+$ambient_temp_max_crit  = 30;
+$ambient_temp_min_warn  = 15;
+$ambient_temp_max_warn  = 25;
+$cpu_temp_min_crit      = 5; 
+$cpu_temp_max_crit      = 75;
+$cpu_temp_min_warn      = 10;
+$cpu_temp_max_warn      = 70;
+$gpu_temp_min_crit      = 5; 
+$gpu_temp_max_crit      = 75;
+$gpu_temp_min_warn      = 10;
+$gpu_temp_max_warn      = 70;
+
+#Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"       => \$opt_h,
+      "w=s" => \$opt_w, "warning=s"  => \$opt_w, "warn=s" => \$opt_w,
+      "c=s" => \$opt_c, "critical=s" => \$opt_c, "crit=s" => \$opt_c,
+      "v"   => \$opt_v, "verbose"    => \$opt_v, 
+   );
+   #
+   #
+   # see if user is asking for help
+   if ( defined($opt_h) ) {  
+      print "Nagios plugin for determining temperature \n";
+      print "$0 [options] \n";
+      print "    where options are: \n";
+      print "    Examples:    \n";
+      print "\n\n";
+      exit;
+   } 							#end of if block
+   #
+   #
+   # see if user provided -v or --verbose switch
+   if ( defined($opt_v) ) {  
+      $verbose = "yes";
+   } 							#end of if block
+} 				                      	#end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   unless ( -e "/sys/class/thermal/thermal_zone0/temp") {
+      print "$CHECK_NAME Unknown - cannot find /sys/class/thermal/thermal_zone0/temp \n";
+      exit $UNKNOWN;                                    #exit script
+   }
+   unless ( -r "/sys/class/thermal/thermal_zone0/temp") {
+      print "$CHECK_NAME Unknown - /sys/class/thermal/thermal_zone0/temp is not readable by the current user \n";
+      exit $UNKNOWN;                                    #exit script
+   }
+   unless ( -e "$vcgencmd") {
+      print "$CHECK_NAME Unknown - cannot find $vcgencmd \n";
+      exit $UNKNOWN;                                    #exit script
+   }
+   unless ( -x "$vcgencmd") {
+      print "$CHECK_NAME Unknown - $vcgencmd is not executable by the current user \n";
+      exit $UNKNOWN;                                    #exit script
+   }
+   if ( -e "$digitemp") {				#the $digitemp binary is optional, if it exists, check for /dev/ttyUSB0
+      unless ( -x "$digitemp") {
+         print "$CHECK_NAME Unknown - $digitemp is not executable by the current user \n";
+         exit $UNKNOWN;                                 #exit script
+      }							#end of unless block
+      unless ( -r "/dev/ttyUSB0") {
+         print "$CHECK_NAME Unknown - /dev/ttyUSB0 is not readable by the current user \n";
+         exit $UNKNOWN;                                 #exit script
+      }							#end of unless block
+      unless ( -w "/dev/ttyUSB0") {
+         print "$CHECK_NAME Unknown - /dev/ttyUSB0 is not writeable by the current user \n";
+         exit $UNKNOWN;                                 #exit script
+      }							#end of unless block
+   }							#end of if block
+}                                                       #end of subroutine
+
+
+
+
+sub get_cpu_temperature {
+   #
+   print "running get_cpu_temperature subroutine \n" if ($verbose eq "yes");
+   #
+   # Sample output:   
+   # $ cat /sys/class/thermal/thermal_zone0/temp
+   # 44517
+   #
+   $cmd = "cat /sys/class/thermal/thermal_zone0/temp";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");                 	     #open filehandle using command output
+   while (<IN>) {                                    #read a line from filehandle
+      if ( /^([0-9]+)/ ) { 	     	     	     #parse out the temperature in thousandths of degrees celsius
+         $cpu_temperature=$1;			     #assign value to variable
+         $cpu_temperature = sprintf( "%.1f", $cpu_temperature / 1000 ); #convert from thousandths of degrees to degrees
+         print "   CPU temperature is $cpu_temperature C \n" if ($verbose eq "yes");
+      }
+      unless ($cpu_temperature) {     		     #could not find temperature. 
+         print "$CHECK_NAME Unknown - could not determine temperature on CPU chip.  Try running this command: cat /sys/class/thermal/thermal_zone0/temp \n";
+         exit $UNKNOWN;
+      }
+   }                                                 #end of while loop
+   close IN;                                         #close filehandle
+}                                                       #end of subroutine
+
+
+sub get_gpu_temperature {
+   #
+   print "running get_gpu_temperature subroutine \n" if ($verbose eq "yes");
+   #
+   # Sample output:   
+   # $ sudo /opt/vc/bin/vcgencmd measure_temp
+   # temp=45.1'C
+   #
+   $cmd = "sudo $vcgencmd measure_temp";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");                 	     #open filehandle using command output
+   while (<IN>) {                                    #read a line from filehandle
+      if ( /^temp=([0-9]+\.[0-9]+)/ ) { 	     #parse out the temperature in degrees celsius
+         $gpu_temperature=$1;			     #assign value to variable
+         print "   GPU temperature is $gpu_temperature C \n" if ($verbose eq "yes");
+      }
+      unless ($gpu_temperature) {     		     #could not find temperature.  Maybe no sudo permission?
+         print "$CHECK_NAME Unknown - could not determine temperature on GPU chip.  Try running this command: sudo $vcgencmd measure_temp \n";
+         exit $UNKNOWN;
+      }
+   }                                                 #end of while loop
+   close IN;                                         #close filehandle
+}                                                       #end of subroutine
+
+
+
+
+sub get_digitemp_temperature_readings {
+   #
+   print "running get_digitemp_temperature_readings subroutine \n" if ($verbose eq "yes");
+   #
+   # Sample output:   
+   # /usr/local/digitemp/digitemp_DS9097U -a
+   # DigiTemp v3.7.1 Copyright 1996-2016 by Brian C. Lane
+   # GNU General Public License v2.0 - http://www.digitemp.com
+   # Dec 15 22:24:31 Sensor 0 C: 16.50 F: 61.70
+   # Dec 15 22:24:32 Sensor 1 C: 6.38 F: 43.47
+   #
+   $sensor0_c = "unknown"; 		             	#initialize variable
+   $sensor0_f = "unknown"; 		             	#initialize variable
+   $sensor1_c = "unknown"; 		             	#initialize variable
+   $sensor1_f = "unknown"; 		             	#initialize variable
+   # 
+   if ( -e "$digitemp" ) {			     	#only run this section if the $digitemp binary exists
+      $cmd = "$digitemp -a";
+      print "   running command: $cmd \n" if ($verbose eq "yes");
+      open (IN,"$cmd 2>&1|");                 	     	#open filehandle using command output
+      while (<IN>) {                                 	#read a line from filehandle
+         if ( /does not exist!/ ) {  			# Error, serial port '' does not exist!	
+            print "$CHECK_NAME Unknown - could not determine serial port.  Try running this command: $digitemp -i -s /dev/ttyUSB0 \n";
+            exit $UNKNOWN;
+         }
+         if ( /Sensor 0 C: ([0-9\.]+) +F: ([0-9\.]+)/ ) {
+            $sensor0_c = $1; 		             	#capture celsius    temperature reading
+            $sensor0_f = $2; 		             	#capture fahrenheit temperature reading
+            print "   sensor 0: $sensor0_c C \n" if ($verbose eq "yes");
+         }                                              #end of if block
+         if ( /Sensor 1 C: ([0-9\.]+) +F: ([0-9\.]+)/ ) {
+            $sensor1_c = $1; 		             	#capture celsius    temperature reading
+            $sensor1_f = $2; 		             	#capture fahrenheit temperature reading
+            print "   sensor 1: $sensor1_c C \n" if ($verbose eq "yes");
+         }                                              #end of if block
+      }                                                 #end of while loop
+      close IN;                                         #close filehandle
+   }						     	#end of if block
+}						     	#end of subroutine
+
+
+
+
+sub retry_digitemp_temperature_readings {
+   #
+   print "running retry_temperature subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine only gets executed if the query to the external digitemp temperature sensors timed out
+   # The external digitemp sensors do occasionally timeout if queried in rapid succession, so this waits 5 seconds and tries one more time
+   #
+   if ( -e "$digitemp" ) {			     	#only run this section if the $digitemp binary exists
+      if ( ($sensor0_c eq "unknown") || ($sensor0_f eq "unknown") || ($sensor1_c eq "unknown") || ($sensor1_f eq "unknown") ) {
+         sleep 5;					     # wait 5 seconds between queries of temperature sensors
+         get_digitemp_temperature_readings;				     #call subroutine to query temperature sensors again
+      } 						     #end of if block
+      #
+      # try again just in case there was another timeout
+      if ( ($sensor0_c eq "unknown") || ($sensor0_f eq "unknown") || ($sensor1_c eq "unknown") || ($sensor1_f eq "unknown") ) {
+         sleep 5;					     # wait 5 seconds between queries of temperature sensors
+         get_digitemp_temperature_readings;		     #call subroutine to query temperature sensors again
+      } 						     #end of if block
+   } 						     	     #end of if block
+}						             #end of subroutine
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   #
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   #
+   # Start by including the onboard CPU and GPU temperatures in the performance data
+   $perf_data = "";
+   $perf_data = "$perf_data cpu_temp=$cpu_temperature;$cpu_temp_min_crit:$cpu_temp_max_crit;$cpu_temp_min_warn:$cpu_temp_max_warn";
+   $perf_data = "$perf_data gpu_temp=$gpu_temperature;$gpu_temp_min_crit:$gpu_temp_max_crit;$gpu_temp_min_warn:$gpu_temp_max_warn";
+   #
+   # If the $digitemp binary exists, add the external temperature sensor values to the performance data
+   if ( -e "$digitemp" ) {			     	#only run this section if the $digitemp binary exists
+      $perf_data = "$perf_data ambient_temp=$sensor0_c;$ambient_temp_min_crit:$ambient_temp_max_crit;$ambient_temp_min_warn:$ambient_temp_max_warn;; inside_keezer_temp=$sensor1_c;$inside_keezer_min_crit:$inside_keezer_max_crit;$inside_keezer_min_warn:$inside_keezer_max_warn;;";
+   }
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   #
+   $output_details = "";
+   $output_details = "$output_details CPU temperature: $gpu_temperature C.";
+   $output_details = "$output_details GPU temperature: $gpu_temperature C.";
+   #
+   # Check for CPU/GPU temperatures outside the acceptable range
+   if ( $cpu_temperature < $cpu_temp_min_warn ) {
+      print "$CHECK_NAME WARN - CPU temperature is $cpu_temperature C.  This is too cold.  Please investigate. $output_details | $perf_data \n";
+      exit $WARN;
+   } 
+   if ( $cpu_temperature > $cpu_temp_max_warn ) {
+      print "$CHECK_NAME WARN - CPU temperature is $cpu_temperature C.  This is too warm.  Please investigate. $output_details | $perf_data \n";
+      exit $WARN;
+   } 
+   if ( $gpu_temperature < $gpu_temp_min_warn ) {
+      print "$CHECK_NAME WARN - GPU temperature is $gpu_temperature C.  This is too cold.  Please investigate. $output_details | $perf_data \n";
+      exit $WARN;
+   } 
+   if ( $gpu_temperature > $gpu_temp_max_warn ) {
+      print "$CHECK_NAME WARN - GPU temperature is $gpu_temperature C.  This is too warm.  Please investigate. $output_details | $perf_data \n";
+      exit $WARN;
+   } 
+   #
+   #
+   #
+   # If a digitemp external temperature sensor exists, add those temperature readings to the output
+   if ( -e "$digitemp" ) {			     	#only run this section if the $digitemp binary exists
+      $output_details = "$output_details External sensor 0 (wine cellar ambient) temperature: $sensor0_c C.  External sensor 1 (inside keezer) temperature: $sensor1_c C.";
+      #
+      if ( ($sensor0_c eq "unknown") || ($sensor0_f eq "unknown") ) {
+         print "$CHECK_NAME Unknown - could not read temperature sensor 0 \n";
+         exit $UNKNOWN;
+      }
+      if ( ($sensor1_c eq "unknown") || ($sensor1_f eq "unknown") ) {
+         print "$CHECK_NAME Unknown - could not read temperature sensor 1 \n";
+         exit $UNKNOWN;
+      }
+      if ( $sensor0_c < $ambient_temp_min_warn ) {
+         print "$CHECK_NAME WARN - ambient temperature in wine cellar is $sensor0_c degrees C.  This is too cold.  Please investigate. $output_details | $perf_data \n";
+         exit $WARN;
+      } 
+      if ( $sensor0_c > $ambient_temp_max_warn ) {
+         print "$CHECK_NAME WARN - ambient temperature in wine cellar is $sensor0_c degrees C.  This is too warm.  Please investigate. $output_details | $perf_data \n";
+         exit $WARN;
+      } 
+      #
+      if ( $sensor1_c < $inside_keezer_min_warn ) {
+         print "$CHECK_NAME WARN - temperature inside keezer is $sensor0_c degrees C.  This is too cold.  Please investigate. $output_details | $perf_data \n";
+         exit $WARN;
+      } 
+      if ( $sensor1_c > $inside_keezer_max_warn ) {
+         print "$CHECK_NAME WARN - temperature inside keezer is $sensor0_c degrees C.  This is too warm.  Please investigate. $output_details | $perf_data \n";
+         exit $WARN;
+      } 
+   } 
+   #
+   # We get this far if everything is ok
+   print "$CHECK_NAME OK - $output_details | $perf_data \n";
+   exit $OK;
+
+   #
+   # we should never get this far
+   print "$CHECK_NAME Unknown - Inconceivable! Could not read temperature details \n";
+   exit $UNKNOWN;
+}
+
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------
+#    main body of program
+# -----------------------------------------------------------------
+get_options;
+sanity_checks;
+get_cpu_temperature;
+get_gpu_temperature;
+get_digitemp_temperature_readings;
+retry_digitemp_temperature_readings;
+print_output;
+
