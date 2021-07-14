@@ -37,3 +37,9 @@ If you are using the NRPE method, you will also need a command definition simila
     command[check_raspi_temperature]=/usr/local/nagios/libexec/check_raspi_temperature
 ```
  
+# Output
+
+Output will look similar to the following.  This example has a 1-wire USB-attached sensor with two temperature probes.
+```
+temperature OK -  CPU temperature: 44.0 C. GPU temperature: 44.0 C. External sensor 0 (wine cellar ambient) temperature: 23.75 C.  External sensor 1 (inside keezer) temperature: 2.75 C. |  cpu_temp=44.0;5:75;10:70 gpu_temp=44.0;5:75;10:70 ambient_temp=23.75;10:30;15:25;; inside_keezer_temp=2.75;1:14;2:7;;
+```
