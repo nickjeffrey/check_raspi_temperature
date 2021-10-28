@@ -3,7 +3,7 @@ nagios check for Raspberry Pi onboard CPU/GPU temperature sensors
 
 This is useful when a Raspberry Pi has been shoved in a corner of your data center / wine cellar / etc to warn about extreme temperatures.
 
-The following external sensors will be reported if they are detected. 
+The following external sensors will be reported if they are detected.  Pull requests to support additional sensors are most welcome.
 ```
 DigiTemp DS9097U 1-wire USB-attached temperature sensor
 0c45:7401 Microdia TEMPer Temperature Sensor
