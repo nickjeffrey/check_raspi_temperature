@@ -2,10 +2,11 @@
 nagios check for Raspberry Pi onboard CPU/GPU temperature sensors
 
 The following external sensors will be reported if they are detected.  0c45:7402 Microdia TEMPerHUM Temperature & Humidity Sensor
+```
 DigiTemp DS9097U 1-wire USB-attached temperature sensor
 0c45:7401 Microdia TEMPer Temperature Sensor
 0c45:7402 Microdia TEMPerHUM Temperature & Humidity Sensor
-
+```
 
 # Requirements
 ssh on nagios server, perl and ssh on monitored Raspberry Pi
